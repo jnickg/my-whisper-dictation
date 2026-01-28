@@ -1,0 +1,33 @@
+[Unit]
+Description=Whisper Dictation Daemon
+Documentation=https://github.com/openai/whisper
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/whisper_dictate_daemon.py
+
+# Pass Wayland environment for wtype to work
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY
+
+# Environment configuration
+# Model options: tiny.en, base.en, small.en, medium.en, large
+Environment="JNICKG_DICTATE_MODEL=base.en"
+Environment="JNICKG_DICTATE_SOCKET=/tmp/jnickg-dictate.sock"
+Environment="JNICKG_DICTATE_AUDIO=/tmp/jnickg-dictation.wav"
+# Input method: wtype (Wayland), xdotool (X11), ydotool (Wayland alternative)
+Environment="JNICKG_DICTATE_INPUT_METHOD=ydotool"
+
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=false
+ReadWritePaths=/tmp %h/.cache/whisper
+
+[Install]
+WantedBy=graphical-session.target
