@@ -1,0 +1,3 @@
+[submodule "SimulStreaming"]
+	path = SimulStreaming
+	url = git@github.com:jnickg/SimulStreaming.git
