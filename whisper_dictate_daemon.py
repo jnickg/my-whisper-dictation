@@ -83,8 +83,8 @@ def send_backspaces(count: int):
 
 
 def parse_streaming_line(line: str) -> str:
-    """Parse '<start_ms> <end_ms> <text>' format, return text."""
-    parts = line.strip().split(maxsplit=2)
+    """Parse '<start_ms> <end_ms>  <text>' format, return text (preserving leading space)."""
+    parts = line.strip().split(' ', maxsplit=2)
     if len(parts) >= 3:
         return parts[2]
     return ""
@@ -100,30 +100,18 @@ def find_common_prefix_length(s1: str, s2: str) -> int:
 
 
 def handle_streaming_output(new_text: str):
-    """Handle incremental typing with backspace corrections."""
+    """Handle streaming output by typing each segment directly."""
     global typed_so_far
 
     if not new_text:
         return
 
-    # Find common prefix
-    common_len = find_common_prefix_length(typed_so_far, new_text)
+    # Each line from the server is a new segment - type it directly
+    log(f"Typing: {repr(new_text)}")
+    type_text(new_text)
 
-    # Calculate what needs to change
-    chars_to_delete = len(typed_so_far) - common_len
-    chars_to_type = new_text[common_len:]
-
-    # Apply corrections
-    # if chars_to_delete > 0:
-    #     log(f"Backspacing {chars_to_delete} chars")
-    #     send_backspaces(chars_to_delete)
-
-    if chars_to_type:
-        log(f"Typing: {chars_to_type}")
-        type_text(chars_to_type)
-
-    # Update state
-    typed_so_far = new_text
+    # Accumulate for final result
+    typed_so_far += new_text
 
 
 def reader_thread_func():
