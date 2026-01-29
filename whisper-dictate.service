@@ -1,7 +1,8 @@
 [Unit]
 Description=Whisper Dictation Daemon
 Documentation=https://github.com/openai/whisper
-After=graphical-session.target
+After=graphical-session.target whisper-streaming-server.service
+Requires=whisper-streaming-server.service
 PartOf=graphical-session.target
 
 [Service]
@@ -15,9 +16,11 @@ PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR DISPLAY
 # Model options: tiny.en, base.en, small.en, medium.en, large
 Environment="JNICKG_DICTATE_MODEL=base.en"
 Environment="JNICKG_DICTATE_SOCKET=/tmp/jnickg-dictate.sock"
-Environment="JNICKG_DICTATE_AUDIO=/tmp/jnickg-dictation.wav"
 # Input method: wtype (Wayland), xdotool (X11), ydotool (Wayland alternative)
 Environment="JNICKG_DICTATE_INPUT_METHOD=ydotool"
+# Streaming server configuration
+Environment="JNICKG_DICTATE_STREAMING_HOST=localhost"
+Environment="JNICKG_DICTATE_STREAMING_PORT=43001"
 
 Restart=on-failure
 RestartSec=5
@@ -27,7 +30,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=false
-ReadWritePaths=/tmp %h/.cache/whisper
+ReadWritePaths=/tmp
 
 [Install]
 WantedBy=graphical-session.target

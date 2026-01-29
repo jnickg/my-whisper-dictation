@@ -1,0 +1,36 @@
+[Unit]
+Description=Whisper Streaming Server (SimulStreaming)
+Documentation=https://github.com/jnickg/SimulStreaming
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'exec %h/.cache/whisper-dictate/venv/bin/python3 %h/.local/share/whisper-dictate/SimulStreaming/simulstreaming_whisper_server.py \
+  --host "$JNICKG_DICTATE_STREAMING_HOST" \
+  --port "$JNICKG_DICTATE_STREAMING_PORT" \
+  --lan en \
+  --task transcribe \
+  --vac \
+  --warmup-file %h/.cache/whisper-dictate/warmup.wav \
+  --model_path "%h/.cache/whisper/$JNICKG_DICTATE_MODEL.pt" \
+  --log-level INFO'
+
+# Environment configuration
+# Model name without path or extension (e.g., base.en, small.en, medium.en)
+Environment="JNICKG_DICTATE_MODEL=base.en"
+Environment="JNICKG_DICTATE_STREAMING_HOST=localhost"
+Environment="JNICKG_DICTATE_STREAMING_PORT=43001"
+
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=false
+ReadWritePaths=/tmp %h/.cache/whisper %h/.cache/whisper-dictate %h/.cache/torch %h/.cache/silero-vad-versions
+
+[Install]
+WantedBy=graphical-session.target

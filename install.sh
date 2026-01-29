@@ -6,6 +6,9 @@ set -e
 # Defaults
 MODEL="base.en"
 INPUT_METHOD="ydotool"
+STREAMING_PORT="43001"
+STREAMING_HOST="localhost"
+CLEAN_VENV=false
 
 # Parse arguments
 show_help() {
@@ -16,12 +19,15 @@ show_help() {
     echo "                   Options: tiny.en, base.en, small.en, medium.en, large"
     echo "  --input METHOD   Text input method (default: ydotool)"
     echo "                   Options: ydotool, wtype, xdotool"
+    echo "  --port PORT      Streaming server port (default: 43001)"
+    echo "  --clean          Remove and recreate the Python virtual environment"
     echo "  --help           Show this help message"
     echo
     echo "Examples:"
     echo "  ./install.sh                      # Fresh install with defaults"
     echo "  ./install.sh --model small.en     # Install/update with small model"
     echo "  ./install.sh --input xdotool      # Use xdotool (for X11)"
+    echo "  ./install.sh --clean              # Reinstall with fresh venv"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -33,6 +39,14 @@ while [[ $# -gt 0 ]]; do
         --input)
             INPUT_METHOD="$2"
             shift 2
+            ;;
+        --port)
+            STREAMING_PORT="$2"
+            shift 2
+            ;;
+        --clean)
+            CLEAN_VENV=true
+            shift
             ;;
         --help)
             show_help
@@ -61,6 +75,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "=== Whisper Dictation Installer ==="
 echo "Model: $MODEL"
 echo "Input method: $INPUT_METHOD"
+echo "Streaming port: $STREAMING_PORT"
 echo
 
 # Check for required system packages
@@ -69,6 +84,10 @@ MISSING_PKGS=""
 
 if ! command -v arecord &> /dev/null; then
     MISSING_PKGS="$MISSING_PKGS alsa-utils"
+fi
+
+if ! command -v nc &> /dev/null; then
+    MISSING_PKGS="$MISSING_PKGS openbsd-netcat"
 fi
 
 if [ "$INPUT_METHOD" = "ydotool" ] && ! command -v ydotool &> /dev/null; then
@@ -116,18 +135,80 @@ EOF
     fi
 fi
 
-# Check for whisper
-echo "Checking for OpenAI Whisper..."
-if ! python3 -c "import whisper" &> /dev/null; then
-    echo "Installing openai-whisper via pip..."
-    pip install --user openai-whisper
-fi
-
 # Create directories
 echo "Creating directories..."
 mkdir -p ~/.local/bin
 mkdir -p ~/.config/systemd/user
 mkdir -p ~/.cache/whisper
+mkdir -p ~/.cache/whisper-dictate
+mkdir -p ~/.cache/torch
+mkdir -p ~/.cache/silero-vad-versions
+mkdir -p ~/.local/share/whisper-dictate
+
+# Install SimulStreaming
+echo "Installing SimulStreaming..."
+if [ -d "$SCRIPT_DIR/SimulStreaming" ]; then
+    rm -rf ~/.local/share/whisper-dictate/SimulStreaming
+    cp -r "$SCRIPT_DIR/SimulStreaming" ~/.local/share/whisper-dictate/SimulStreaming
+else
+    echo "Error: SimulStreaming directory not found in $SCRIPT_DIR"
+    echo "Make sure to clone with submodules: git clone --recurse-submodules"
+    exit 1
+fi
+
+# Create virtual environment for SimulStreaming
+VENV_DIR="$HOME/.cache/whisper-dictate/venv"
+if [ -d "$VENV_DIR" ] && [ "$CLEAN_VENV" = false ]; then
+    echo "Virtual environment already exists at $VENV_DIR (use --clean to recreate)"
+else
+    echo "Creating virtual environment at $VENV_DIR..."
+    if [ -d "$VENV_DIR" ]; then
+        echo "Removing existing venv..."
+        rm -rf "$VENV_DIR"
+    fi
+    python3 -m venv "$VENV_DIR"
+
+    # Install SimulStreaming dependencies into venv
+    echo "Installing SimulStreaming dependencies into venv..."
+    source "$VENV_DIR/bin/activate"
+
+    pip install --upgrade pip
+    pip install librosa torchaudio torch tqdm tiktoken
+
+    # Install triton on Linux x86_64 only
+    if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+        pip install 'triton>=2.0.0'
+    fi
+
+    # Install openai-whisper (needed by SimulStreaming)
+    pip install openai-whisper
+
+    deactivate
+    echo "Virtual environment setup complete."
+fi
+
+# Generate warmup WAV file (1 second of silence at 16kHz mono)
+echo "Generating warmup audio file..."
+WARMUP_FILE="$HOME/.cache/whisper-dictate/warmup.wav"
+if [ ! -f "$WARMUP_FILE" ]; then
+    python3 -c "
+import wave
+import struct
+
+# Generate 1 second of silence at 16kHz mono
+sample_rate = 16000
+duration = 1  # seconds
+num_samples = sample_rate * duration
+
+with wave.open('$WARMUP_FILE', 'w') as wav_file:
+    wav_file.setnchannels(1)
+    wav_file.setsampwidth(2)  # 16-bit
+    wav_file.setframerate(sample_rate)
+    # Write silence (zeros)
+    wav_file.writeframes(struct.pack('<' + 'h' * num_samples, *([0] * num_samples)))
+print('Warmup file created: $WARMUP_FILE')
+"
+fi
 
 # Install scripts
 echo "Installing scripts..."
@@ -136,18 +217,32 @@ cp "$SCRIPT_DIR/dictate.py" ~/.local/bin/
 chmod +x ~/.local/bin/whisper_dictate_daemon.py
 chmod +x ~/.local/bin/dictate.py
 
-# Install systemd service with configured values
-echo "Installing systemd service..."
+# Install streaming server systemd service
+echo "Installing streaming server systemd service..."
+sed -e "s/JNICKG_DICTATE_MODEL=.*/JNICKG_DICTATE_MODEL=$MODEL\"/" \
+    -e "s/JNICKG_DICTATE_STREAMING_PORT=.*/JNICKG_DICTATE_STREAMING_PORT=$STREAMING_PORT\"/" \
+    "$SCRIPT_DIR/whisper-streaming-server.service" > ~/.config/systemd/user/whisper-streaming-server.service
+
+# Install main dictation systemd service with configured values
+echo "Installing dictation daemon systemd service..."
 sed -e "s/JNICKG_DICTATE_MODEL=.*/JNICKG_DICTATE_MODEL=$MODEL\"/" \
     -e "s/JNICKG_DICTATE_INPUT_METHOD=.*/JNICKG_DICTATE_INPUT_METHOD=$INPUT_METHOD\"/" \
+    -e "s/JNICKG_DICTATE_STREAMING_PORT=.*/JNICKG_DICTATE_STREAMING_PORT=$STREAMING_PORT\"/" \
     "$SCRIPT_DIR/whisper-dictate.service" > ~/.config/systemd/user/whisper-dictate.service
 
-# Reload and enable service
-echo "Enabling systemd service..."
+# Reload and enable services
+echo "Enabling systemd services..."
 systemctl --user daemon-reload
+systemctl --user enable whisper-streaming-server.service
 systemctl --user enable whisper-dictate.service
 
-# Restart service (restart instead of start to pick up changes)
+# Restart services (restart instead of start to pick up changes)
+echo "Restarting streaming server..."
+systemctl --user restart whisper-streaming-server.service
+
+echo "Waiting for streaming server to initialize..."
+sleep 3
+
 echo "Restarting whisper-dictate service..."
 systemctl --user restart whisper-dictate.service
 
@@ -165,8 +260,14 @@ echo
 echo "Configuration:"
 echo "  Model: $MODEL"
 echo "  Input: $INPUT_METHOD"
+echo "  Streaming port: $STREAMING_PORT"
 echo
 echo "To change settings, run again with options:"
 echo "  ./install.sh --model small.en"
 echo
-echo "Check status: systemctl --user status whisper-dictate.service"
+echo "Check status:"
+echo "  systemctl --user status whisper-streaming-server.service"
+echo "  systemctl --user status whisper-dictate.service"
+echo
+echo "Test streaming server:"
+echo "  nc -z localhost $STREAMING_PORT && echo 'Server OK'"

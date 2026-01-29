@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Whisper Dictation Daemon
+Whisper Dictation Daemon (Streaming Mode)
 
-A systemd-compatible daemon that keeps the Whisper model loaded in memory
-and listens on a Unix socket for dictation commands.
+A systemd-compatible daemon that provides real-time speech-to-text dictation
+by connecting to a SimulStreaming server. Text appears as you speak instead
+of after recording stops.
 """
 
-import whisper
 import subprocess
 import os
 import signal
@@ -15,32 +15,26 @@ import sys
 import threading
 import json
 import time
-import tempfile
 from pathlib import Path
 
 # Configuration
 SOCKET_PATH = os.environ.get("JNICKG_DICTATE_SOCKET", "/tmp/jnickg-dictate.sock")
-AUDIO_FILE = os.environ.get("JNICKG_DICTATE_AUDIO", "/tmp/jnickg-dictation.wav")
-MODEL_NAME = os.environ.get("JNICKG_DICTATE_MODEL", "base.en")
-TEXT_INPUT_METHOD = os.environ.get("JNICKG_DICTATE_INPUT_METHOD", "ydotool")  # ydotool, wtype, or xdotool
+TEXT_INPUT_METHOD = os.environ.get("JNICKG_DICTATE_INPUT_METHOD", "ydotool")
+STREAMING_HOST = os.environ.get("JNICKG_DICTATE_STREAMING_HOST", "localhost")
+STREAMING_PORT = os.environ.get("JNICKG_DICTATE_STREAMING_PORT", "43001")
 
 # Global state
-model = None
-recording_process = None
-recording_lock = threading.Lock()
+arecord_proc = None
+nc_proc = None
+reader_thread = None
+streaming_lock = threading.Lock()
+typed_so_far = ""
+stop_reader = threading.Event()
 
 
 def log(msg: str):
     """Log to stderr for systemd journal."""
     print(msg, file=sys.stderr, flush=True)
-
-
-def load_model():
-    """Load the Whisper model."""
-    global model
-    log(f"Loading Whisper model: {MODEL_NAME}")
-    model = whisper.load_model(MODEL_NAME)
-    log("Model loaded successfully")
 
 
 def type_text(text: str):
@@ -50,13 +44,10 @@ def type_text(text: str):
 
     try:
         if TEXT_INPUT_METHOD == "wtype":
-            # wtype for Wayland
             subprocess.run(["wtype", "--", text], check=True)
         elif TEXT_INPUT_METHOD == "ydotool":
-            # ydotool for Wayland (requires ydotoold)
             subprocess.run(["ydotool", "type", "--", text], check=True)
         elif TEXT_INPUT_METHOD == "xdotool":
-            # xdotool for X11
             subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text], check=True)
         else:
             log(f"Unknown input method: {TEXT_INPUT_METHOD}")
@@ -66,95 +57,250 @@ def type_text(text: str):
         log(f"Text input tool not found: {TEXT_INPUT_METHOD}")
 
 
-def start_recording() -> dict:
-    """Start audio recording."""
-    global recording_process
+def send_backspaces(count: int):
+    """Send backspace key presses to delete characters."""
+    if count <= 0:
+        return
 
-    with recording_lock:
-        if recording_process is not None:
-            return {"status": "error", "message": "Already recording"}
+    try:
+        if TEXT_INPUT_METHOD == "wtype":
+            # wtype uses key names
+            for _ in range(count):
+                subprocess.run(["wtype", "-k", "BackSpace"], check=True)
+        elif TEXT_INPUT_METHOD == "ydotool":
+            # ydotool: key code 14 is backspace, :1 press :0 release
+            for _ in range(count):
+                subprocess.run(["ydotool", "key", "14:1", "14:0"], check=True)
+        elif TEXT_INPUT_METHOD == "xdotool":
+            for _ in range(count):
+                subprocess.run(["xdotool", "key", "BackSpace"], check=True)
+        else:
+            log(f"Unknown input method for backspace: {TEXT_INPUT_METHOD}")
+    except subprocess.CalledProcessError as e:
+        log(f"Failed to send backspaces: {e}")
+    except FileNotFoundError:
+        log(f"Text input tool not found: {TEXT_INPUT_METHOD}")
+
+
+def parse_streaming_line(line: str) -> str:
+    """Parse '<start_ms> <end_ms> <text>' format, return text."""
+    parts = line.strip().split(maxsplit=2)
+    if len(parts) >= 3:
+        return parts[2]
+    return ""
+
+
+def find_common_prefix_length(s1: str, s2: str) -> int:
+    """Find the length of the longest common prefix between two strings."""
+    min_len = min(len(s1), len(s2))
+    for i in range(min_len):
+        if s1[i] != s2[i]:
+            return i
+    return min_len
+
+
+def handle_streaming_output(new_text: str):
+    """Handle incremental typing with backspace corrections."""
+    global typed_so_far
+
+    if not new_text:
+        return
+
+    # Find common prefix
+    common_len = find_common_prefix_length(typed_so_far, new_text)
+
+    # Calculate what needs to change
+    chars_to_delete = len(typed_so_far) - common_len
+    chars_to_type = new_text[common_len:]
+
+    # Apply corrections
+    # if chars_to_delete > 0:
+    #     log(f"Backspacing {chars_to_delete} chars")
+    #     send_backspaces(chars_to_delete)
+
+    if chars_to_type:
+        log(f"Typing: {chars_to_type}")
+        type_text(chars_to_type)
+
+    # Update state
+    typed_so_far = new_text
+
+
+def reader_thread_func():
+    """Thread function to read streaming output from nc and type incrementally."""
+    global nc_proc, typed_so_far
+
+    log("Reader thread started")
+
+    while not stop_reader.is_set():
+        if nc_proc is None or nc_proc.stdout is None:
+            break
 
         try:
-            # Remove old audio file if it exists
-            if os.path.exists(AUDIO_FILE):
-                os.remove(AUDIO_FILE)
+            line = nc_proc.stdout.readline()
+            if not line:
+                # EOF - connection closed
+                log("Reader: EOF from nc")
+                break
 
-            # Start recording with arecord (ALSA)
-            # 16kHz mono WAV is what Whisper expects
-            # -d 300 = max 5 minutes, -q = quiet
-            recording_process = subprocess.Popen(
-                ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", "300", AUDIO_FILE],
-                stdout=subprocess.DEVNULL,
+            line = line.decode("utf-8", errors="replace").strip()
+            if line:
+                log(f"Received: {line}")
+                text = parse_streaming_line(line)
+                if text:
+                    handle_streaming_output(text)
+
+        except Exception as e:
+            log(f"Reader error: {e}")
+            break
+
+    log("Reader thread exiting")
+
+
+def check_streaming_server() -> bool:
+    """Check if the streaming server is running and accepting connections."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect((STREAMING_HOST, int(STREAMING_PORT)))
+            return True
+    except (socket.error, socket.timeout, ValueError):
+        return False
+
+
+def start_streaming() -> dict:
+    """Start streaming dictation."""
+    global arecord_proc, nc_proc, reader_thread, typed_so_far, stop_reader
+
+    with streaming_lock:
+        if arecord_proc is not None:
+            return {"status": "error", "message": "Already streaming"}
+
+        # Check if streaming server is available
+        if not check_streaming_server():
+            return {
+                "status": "error",
+                "message": f"Streaming server not available at {STREAMING_HOST}:{STREAMING_PORT}. "
+                           "Check: systemctl --user status whisper-streaming-server"
+            }
+
+        try:
+            # Reset state
+            typed_so_far = ""
+            stop_reader.clear()
+
+            # Start arecord piping to nc
+            # arecord: -f S16_LE (16-bit signed little-endian), -c1 (mono), -r 16000 (16kHz), -t raw (raw PCM)
+            arecord_proc = subprocess.Popen(
+                ["arecord", "-f", "S16_LE", "-c1", "-r", "16000", "-t", "raw", "-D", "default"],
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL
             )
-            log("Recording started")
-            return {"status": "ok", "message": "Recording started"}
-        except FileNotFoundError:
-            return {"status": "error", "message": "rec (sox) not found"}
+
+            nc_proc = subprocess.Popen(
+                ["nc", STREAMING_HOST, STREAMING_PORT],
+                stdin=arecord_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
+            # Allow SIGPIPE propagation
+            arecord_proc.stdout.close()
+
+            # Start reader thread
+            reader_thread = threading.Thread(target=reader_thread_func, daemon=True)
+            reader_thread.start()
+
+            log(f"Streaming started to {STREAMING_HOST}:{STREAMING_PORT}")
+            return {"status": "ok", "message": "Streaming started"}
+
+        except FileNotFoundError as e:
+            arecord_proc = None
+            nc_proc = None
+            return {"status": "error", "message": f"Required tool not found: {e.filename}"}
         except Exception as e:
+            arecord_proc = None
+            nc_proc = None
             return {"status": "error", "message": str(e)}
 
 
-def stop_recording() -> dict:
-    """Stop recording and transcribe."""
-    global recording_process
+def stop_streaming() -> dict:
+    """Stop streaming and return the final transcription."""
+    global arecord_proc, nc_proc, reader_thread, typed_so_far, stop_reader
 
-    with recording_lock:
-        if recording_process is None:
-            return {"status": "error", "message": "Not recording"}
+    with streaming_lock:
+        if arecord_proc is None:
+            return {"status": "error", "message": "Not streaming"}
+
+        final_text = typed_so_far
 
         try:
-            # Stop the recording process gracefully with SIGINT
-            # (SIGTERM cuts off the buffer, SIGINT lets rec flush)
-            recording_process.send_signal(signal.SIGINT)
-            # Give rec a moment to flush its audio buffer
-            time.sleep(0.5)
-            recording_process.wait(timeout=5)
-            recording_process = None
-            log("Recording stopped")
+            # Signal reader thread to stop
+            stop_reader.set()
+
+            # Stop arecord gracefully
+            if arecord_proc and arecord_proc.poll() is None:
+                arecord_proc.terminate()
+                try:
+                    arecord_proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    arecord_proc.kill()
+
+            # Wait for nc to close (server sends final segment on disconnect)
+            if nc_proc and nc_proc.poll() is None:
+                try:
+                    nc_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    nc_proc.terminate()
+
+            # Wait for reader thread to finish
+            if reader_thread and reader_thread.is_alive():
+                reader_thread.join(timeout=2)
+
+            log("Streaming stopped")
+
+            # Get the final text that was typed
+            final_text = typed_so_far
+
         except Exception as e:
-            recording_process = None
-            return {"status": "error", "message": f"Failed to stop recording: {e}"}
+            log(f"Error stopping streaming: {e}")
+        finally:
+            arecord_proc = None
+            nc_proc = None
+            reader_thread = None
 
-    # Transcribe the audio
-    if not os.path.exists(AUDIO_FILE):
-        return {"status": "error", "message": "No audio file found"}
-
-    try:
-        log("Transcribing...")
-        result = model.transcribe(AUDIO_FILE, fp16=False)
-        text = result["text"].strip()
-        log(f"Transcribed: {text}")
-
-        if text:
-            type_text(text)
-            return {"status": "ok", "message": "Transcribed", "text": text}
+        if final_text:
+            return {"status": "ok", "message": "Stopped", "text": final_text}
         else:
-            return {"status": "ok", "message": "No speech detected", "text": ""}
-    except Exception as e:
-        return {"status": "error", "message": f"Transcription failed: {e}"}
+            return {"status": "ok", "message": "Stopped (no speech detected)", "text": ""}
 
 
-def toggle_recording() -> dict:
-    """Toggle recording state."""
-    with recording_lock:
-        is_recording = recording_process is not None
+def toggle_streaming() -> dict:
+    """Toggle streaming state."""
+    with streaming_lock:
+        is_streaming = arecord_proc is not None
 
-    if is_recording:
-        return stop_recording()
+    if is_streaming:
+        return stop_streaming()
     else:
-        return start_recording()
+        return start_streaming()
 
 
 def get_status() -> dict:
     """Get current daemon status."""
-    with recording_lock:
-        is_recording = recording_process is not None
+    with streaming_lock:
+        is_streaming = arecord_proc is not None
+
+    server_available = check_streaming_server()
+
     return {
         "status": "ok",
-        "recording": is_recording,
-        "model": MODEL_NAME,
-        "input_method": TEXT_INPUT_METHOD
+        "streaming": is_streaming,
+        "server_available": server_available,
+        "streaming_host": STREAMING_HOST,
+        "streaming_port": STREAMING_PORT,
+        "input_method": TEXT_INPUT_METHOD,
+        "typed_so_far": typed_so_far if is_streaming else ""
     }
 
 
@@ -163,11 +309,11 @@ def handle_command(cmd: str) -> dict:
     cmd = cmd.strip().lower()
 
     if cmd == "start":
-        return start_recording()
+        return start_streaming()
     elif cmd == "stop":
-        return stop_recording()
+        return stop_streaming()
     elif cmd == "toggle":
-        return toggle_recording()
+        return toggle_streaming()
     elif cmd == "status":
         return get_status()
     elif cmd == "ping":
@@ -191,14 +337,20 @@ def handle_client(conn: socket.socket):
 
 def cleanup(signum=None, frame=None):
     """Clean up on exit."""
-    global recording_process
+    global arecord_proc, nc_proc, stop_reader
 
     log("Shutting down...")
 
-    # Stop any ongoing recording
-    if recording_process:
-        recording_process.terminate()
-        recording_process = None
+    # Stop any ongoing streaming
+    stop_reader.set()
+
+    if arecord_proc:
+        arecord_proc.terminate()
+        arecord_proc = None
+
+    if nc_proc:
+        nc_proc.terminate()
+        nc_proc = None
 
     # Remove socket file
     if os.path.exists(SOCKET_PATH):
@@ -213,8 +365,14 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    # Load the model
-    load_model()
+    log(f"Whisper Dictation Daemon (Streaming Mode)")
+    log(f"Streaming server: {STREAMING_HOST}:{STREAMING_PORT}")
+    log(f"Input method: {TEXT_INPUT_METHOD}")
+
+    # Check streaming server availability (warning only, not fatal)
+    if not check_streaming_server():
+        log(f"Warning: Streaming server not available at {STREAMING_HOST}:{STREAMING_PORT}")
+        log("The server may still be starting up. Dictation will fail until it's ready.")
 
     # Remove stale socket
     if os.path.exists(SOCKET_PATH):
