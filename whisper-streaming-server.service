@@ -30,7 +30,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=false
-ReadWritePaths=/tmp %h/.cache/whisper %h/.cache/whisper-dictate %h/.cache/torch %h/.cache/silero-vad-versions
+ReadWritePaths=/tmp %h/.cache/whisper %h/.cache/whisper-dictate %h/.cache/torch %h/.cache/silero-vad-versions %h/.triton
 
 [Install]
 WantedBy=graphical-session.target

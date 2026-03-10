@@ -143,6 +143,7 @@ mkdir -p ~/.cache/whisper
 mkdir -p ~/.cache/whisper-dictate
 mkdir -p ~/.cache/torch
 mkdir -p ~/.cache/silero-vad-versions
+mkdir -p ~/.triton
 mkdir -p ~/.local/share/whisper-dictate
 
 # Install SimulStreaming
